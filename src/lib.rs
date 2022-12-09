@@ -39,6 +39,8 @@ pub struct JupiterPhoenix {
     base_lots_per_base_unit: u64,
     /// The number of a quote lots per base unit in a tick (tick_size)
     tick_size_in_quote_lots_per_base_unit_per_tick: u64,
+    /// Taker fee basis points
+    taker_fee_bps: u16,
     /// The state of the orderbook (L2)
     ladder: Ladder,
 }
@@ -52,6 +54,7 @@ impl JupiterPhoenix {
         let header = MarketHeader::try_from_slice(header_bytes).unwrap();
         let market = load_with_dispatch(&header.market_size_params, bytes)
             .ok_or(Error::msg("market configuration not found"))?;
+        let taker_fee_bps = market.inner.get_taker_bps();
         Ok(Self {
             market_key: keyed_account.key,
             label: "Phoenix".into(),
@@ -60,6 +63,7 @@ impl JupiterPhoenix {
             program_id: PHOENIX_PROGRAM_ID,
             base_decimals: header.base_params.decimals,
             quote_decimals: header.quote_params.decimals,
+            taker_fee_bps,
             base_lot_size: header.get_base_lot_size(),
             quote_lot_size: header.get_quote_lot_size(),
             base_lots_per_base_unit: market.inner.get_base_lots_per_base_unit(),
@@ -149,8 +153,9 @@ impl Amm for JupiterPhoenix {
             }
         };
 
+        // Not 100% accurate, but it's a reasoanble enough approximation
         Ok(Quote {
-            out_amount,
+            out_amount: ((out_amount * 10000) - self.taker_fee_bps as u64) / 10000,
             ..Quote::default()
         })
     }
@@ -282,5 +287,26 @@ fn test_jupiter_phoenix_integration() {
     println!(
         "Quote result: {:?}",
         out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
+    );
+
+    let in_amount = out_amount;
+
+    println!(
+        "Getting quote for buying SOL with {} USDC",
+        in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
+    );
+    let quote = jupiter_phoenix
+        .quote(&QuoteParams {
+            in_amount,
+            input_mint: jupiter_phoenix.quote_mint,
+            output_mint: jupiter_phoenix.base_mint,
+        })
+        .unwrap();
+
+    let Quote { out_amount, .. } = quote;
+
+    println!(
+        "Quote result: {:?}",
+        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64)
     );
 }
