@@ -8,20 +8,12 @@ use phoenix_types::{
 use std::{collections::HashMap, mem::size_of};
 
 use jupiter_core::amm::{Amm, KeyedAccount};
-use lazy_static::lazy_static;
 use solana_sdk::{instruction::AccountMeta, pubkey, pubkey::Pubkey};
 
 use jupiter::jupiter_override::{Swap, SwapLeg};
 use jupiter_core::amm::{Quote, QuoteParams, SwapLegAndAccountMetas, SwapParams};
 
 pub const PHOENIX_PROGRAM_ID: Pubkey = pubkey!("phnxNHfGNVjpVVuHkceK3MgwZ1bW25ijfWACKhVFbBH");
-lazy_static! {
-    pub static ref PROGRAMS: HashMap<Pubkey, String> = {
-        let mut m = HashMap::new();
-        m.insert(PHOENIX_PROGRAM_ID, "Phoenix".into());
-        m
-    };
-}
 
 #[derive(Clone, Debug)]
 pub struct JupiterPhoenix {

@@ -1873,7 +1873,6 @@ dependencies = [
  "borsh 0.9.3",
  "jupiter",
  "jupiter-core",
- "lazy_static",
  "phoenix-types",
  "rust_decimal",
  "serde",
