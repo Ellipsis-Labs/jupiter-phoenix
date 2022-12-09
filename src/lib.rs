@@ -112,12 +112,34 @@ impl Amm for JupiterPhoenix {
 
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
         let mut out_amount = 0;
+        for a in self.ladder.asks.iter().take(5).rev() {
+            println!(
+                "       {} {}",
+                ((a.price_in_ticks * self.tick_size_in_quote_lots_per_base_unit_per_tick) as f64
+                    / self.quote_lot_size as f64)
+                    / 10f64.powi(self.quote_decimals as i32),
+                (a.size_in_base_lots * self.base_lot_size) as f64
+                    / 10f64.powi(self.base_decimals as i32)
+            );
+        }
+
+        for a in self.ladder.bids.iter().take(5) {
+            println!(
+                "{} {}",
+                (a.size_in_base_lots * self.base_lot_size) as f64
+                    / 10f64.powi(self.base_decimals as i32),
+                ((a.price_in_ticks * self.tick_size_in_quote_lots_per_base_unit_per_tick) as f64
+                    / self.quote_lot_size as f64)
+                    / 10f64.powi(self.quote_decimals as i32),
+            );
+        }
+
         if quote_params.input_mint == self.base_mint {
             let mut base_lot_budget = quote_params.in_amount / self.base_lot_size;
             for LadderOrder {
                 price_in_ticks,
                 size_in_base_lots,
-            } in self.ladder.asks.iter()
+            } in self.ladder.bid.iter()
             {
                 if base_lot_budget == 0 {
                     break;
