@@ -155,7 +155,7 @@ impl Amm for JupiterPhoenix {
 
         // Not 100% accurate, but it's a reasoanble enough approximation
         Ok(Quote {
-            out_amount: ((out_amount * 10000) - self.taker_fee_bps as u64) / 10000,
+            out_amount: (out_amount * (10000 - self.taker_fee_bps as u64)) / 10000,
             ..Quote::default()
         })
     }
