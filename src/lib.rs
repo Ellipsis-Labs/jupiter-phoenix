@@ -231,8 +231,8 @@ fn test_jupiter_phoenix_integration() {
     use std::collections::HashMap;
 
     const SOL_USDC_MARKET: Pubkey = pubkey!("4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg");
+    const BONK_USDC_MARKET: Pubkey = pubkey!("GBMoNx84HsFdVK63t8BZuDgyZhSBaeKWB4pHHpoeRM9z");
 
-    // Going to borrow the Solana FM devnet RPC
     let rpc = RpcClient::new("https://api.mainnet-beta.solana.com/");
     let account = rpc.get_account(&SOL_USDC_MARKET).unwrap();
 
@@ -285,6 +285,77 @@ fn test_jupiter_phoenix_integration() {
 
     println!(
         "Getting quote for buying SOL with {} USDC",
+        in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
+    );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
+    let quote = jupiter_phoenix
+        .quote(&QuoteParams {
+            in_amount,
+            input_mint: jupiter_phoenix.quote_mint,
+            output_mint: jupiter_phoenix.base_mint,
+        })
+        .unwrap();
+
+    let Quote { out_amount, .. } = quote;
+
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
+    println!(
+        "Quote result: {:?} ({})",
+        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64),
+        quote_in / quote_out
+    );
+
+    let account = rpc.get_account(&BONK_USDC_MARKET).unwrap();
+
+    let market_account = KeyedAccount {
+        key: BONK_USDC_MARKET,
+        account,
+        params: None,
+    };
+
+    let mut jupiter_phoenix = JupiterPhoenix::new_from_keyed_account(&market_account).unwrap();
+
+    let accounts_to_update = jupiter_phoenix.get_accounts_to_update();
+
+    let accounts_map = rpc
+        .get_multiple_accounts(&accounts_to_update)
+        .unwrap()
+        .iter()
+        .enumerate()
+        .fold(HashMap::new(), |mut m, (index, account)| {
+            if let Some(account) = account {
+                m.insert(
+                    accounts_to_update[index],
+                    PartialAccount::from(account.clone()),
+                );
+            }
+            m
+        });
+    jupiter_phoenix.update(&accounts_map).unwrap();
+    let in_amount = 100_000_000_000_000;
+    println!(
+        "Getting quote for selling {} BONK",
+        in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64)
+    );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
+    let quote = jupiter_phoenix
+        .quote(&QuoteParams {
+            /// 1B Bonk
+            in_amount,
+            input_mint: jupiter_phoenix.base_mint,
+            output_mint: jupiter_phoenix.quote_mint,
+        })
+        .unwrap();
+
+    let Quote { out_amount, .. } = quote;
+
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
+    println!("Quote result: {:?} ({})", quote_out, quote_out / quote_in);
+
+    let in_amount = out_amount;
+
+    println!(
+        "Getting quote for buying BONK with {} USDC",
         in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
     );
     let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
