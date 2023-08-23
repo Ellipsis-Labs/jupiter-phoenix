@@ -1,19 +1,17 @@
 use anyhow::{Error, Result};
-use borsh::BorshDeserialize;
 use jupiter::Side;
-use phoenix_types::{
-    dispatch::load_with_dispatch,
-    market::{Ladder, LadderOrder, MarketHeader},
-};
+use phoenix::program::load_with_dispatch;
+use phoenix::program::MarketHeader;
+use phoenix::state::markets::{Ladder, LadderOrder};
+use phoenix_sdk_core::sdk_client_core::MarketMetadata;
+use std::ops::Deref;
 use std::{collections::HashMap, mem::size_of};
 
-use jupiter_core::amm::{Amm, KeyedAccount};
-use solana_sdk::{instruction::AccountMeta, pubkey, pubkey::Pubkey};
+use jupiter_core::amm::{Amm, KeyedAccount, PartialAccount};
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
-use jupiter::jupiter_override::{Swap, SwapLeg};
-use jupiter_core::amm::{Quote, QuoteParams, SwapLegAndAccountMetas, SwapParams};
-
-pub const PHOENIX_PROGRAM_ID: Pubkey = pubkey!("phnxNHfGNVjpVVuHkceK3MgwZ1bW25ijfWACKhVFbBH");
+use jupiter::jupiter_override::Swap;
+use jupiter_core::amm::{Quote, QuoteParams, SwapAndAccountMetas, SwapParams};
 
 #[derive(Clone, Debug)]
 pub struct JupiterPhoenix {
@@ -27,22 +25,20 @@ pub struct JupiterPhoenix {
     quote_mint: Pubkey,
     /// The pubkey of the Phoenix program
     program_id: Pubkey,
-    /// Only here for convenience
-    base_decimals: u32,
-    /// Only here for convenience
-    quote_decimals: u32,
-    /// The size of a base lot in base atoms
-    base_lot_size: u64,
-    /// The size of a quote lot in quote atoms
-    quote_lot_size: u64,
-    /// The number of a base lot in a base unit
-    base_lots_per_base_unit: u64,
-    /// The number of a quote lots per base unit in a tick (tick_size)
-    tick_size_in_quote_lots_per_base_unit_per_tick: u64,
+    /// Contain the conversion functions for the market
+    market_metadata: MarketMetadata,
     /// Taker fee basis points
     taker_fee_bps: u16,
     /// The state of the orderbook (L2)
     ladder: Ladder,
+}
+
+impl Deref for JupiterPhoenix {
+    type Target = MarketMetadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.market_metadata
+    }
 }
 
 impl JupiterPhoenix {
@@ -51,25 +47,18 @@ impl JupiterPhoenix {
             .account
             .data
             .split_at(size_of::<MarketHeader>());
-        let header = MarketHeader::try_from_slice(header_bytes).unwrap();
-        let market = load_with_dispatch(&header.market_size_params, bytes)
-            .ok_or(Error::msg("market configuration not found"))?;
-        let taker_fee_bps = market.inner.get_taker_bps();
+        let header = bytemuck::try_from_bytes::<MarketHeader>(header_bytes).unwrap();
+        let market = load_with_dispatch(&header.market_size_params, bytes)?;
+        let taker_fee_bps = market.inner.get_taker_fee_bps();
+        let market_metadata = MarketMetadata::from_header(header)?;
         Ok(Self {
             market_key: keyed_account.key,
             label: "Phoenix".into(),
             base_mint: header.base_params.mint_key,
             quote_mint: header.quote_params.mint_key,
-            program_id: PHOENIX_PROGRAM_ID,
-            base_decimals: header.base_params.decimals,
-            quote_decimals: header.quote_params.decimals,
-            taker_fee_bps,
-            base_lot_size: header.get_base_lot_size(),
-            quote_lot_size: header.get_quote_lot_size(),
-            base_lots_per_base_unit: market.inner.get_base_lots_per_base_unit(),
-            tick_size_in_quote_lots_per_base_unit_per_tick: header
-                .get_tick_size_in_quote_atoms_per_base_unit()
-                / header.get_quote_lot_size(),
+            program_id: phoenix::id(),
+            taker_fee_bps: taker_fee_bps as u16,
+            market_metadata,
             ladder: market.inner.get_ladder(u64::MAX),
         })
     }
@@ -84,6 +73,14 @@ impl JupiterPhoenix {
 }
 
 impl Amm for JupiterPhoenix {
+    fn program_id(&self) -> Pubkey {
+        self.program_id
+    }
+
+    fn from_keyed_account(keyed_account: &KeyedAccount) -> Result<Self> {
+        JupiterPhoenix::new_from_keyed_account(keyed_account)
+    }
+
     fn label(&self) -> String {
         self.label.clone()
     }
@@ -100,12 +97,11 @@ impl Amm for JupiterPhoenix {
         vec![self.market_key]
     }
 
-    fn update(&mut self, accounts_map: &HashMap<Pubkey, Vec<u8>>) -> Result<()> {
-        let market_account_data = accounts_map.get(&self.market_key).unwrap();
-        let (header_bytes, bytes) = &market_account_data.split_at(size_of::<MarketHeader>());
-        let header = MarketHeader::try_from_slice(header_bytes).unwrap();
-        let market = load_with_dispatch(&header.market_size_params, bytes)
-            .ok_or(Error::msg("market configuration not found"))?;
+    fn update(&mut self, accounts_map: &HashMap<Pubkey, PartialAccount>) -> Result<()> {
+        let market_account = accounts_map.get(&self.market_key).unwrap();
+        let (header_bytes, bytes) = &market_account.data.split_at(size_of::<MarketHeader>());
+        let header = bytemuck::try_from_bytes::<MarketHeader>(header_bytes).unwrap();
+        let market = load_with_dispatch(&header.market_size_params, bytes)?;
         self.ladder = market.inner.get_ladder(u64::MAX);
         Ok(())
     }
@@ -113,7 +109,7 @@ impl Amm for JupiterPhoenix {
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
         let mut out_amount = 0;
         if quote_params.input_mint == self.base_mint {
-            let mut base_lot_budget = quote_params.in_amount / self.base_lot_size;
+            let mut base_lot_budget = quote_params.in_amount / self.base_atoms_per_base_lot;
             for LadderOrder {
                 price_in_ticks,
                 size_in_base_lots,
@@ -122,15 +118,14 @@ impl Amm for JupiterPhoenix {
                 if base_lot_budget == 0 {
                     break;
                 }
-                out_amount += price_in_ticks
-                    * size_in_base_lots.min(&base_lot_budget)
-                    * self.tick_size_in_quote_lots_per_base_unit_per_tick
-                    * self.quote_lot_size
-                    / self.base_lots_per_base_unit;
+                out_amount += self.base_lots_and_price_to_quote_atoms(
+                    *size_in_base_lots.min(&base_lot_budget),
+                    *price_in_ticks,
+                );
                 base_lot_budget = base_lot_budget.saturating_sub(*size_in_base_lots);
             }
         } else {
-            let mut quote_lot_budget = quote_params.in_amount / self.quote_lot_size;
+            let mut quote_lot_budget = quote_params.in_amount / self.quote_atoms_per_quote_lot;
             for LadderOrder {
                 price_in_ticks,
                 size_in_base_lots,
@@ -139,16 +134,13 @@ impl Amm for JupiterPhoenix {
                 if quote_lot_budget == 0 {
                     break;
                 }
-                let book_amount_in_quote_lots = price_in_ticks
-                    * size_in_base_lots
-                    * self.tick_size_in_quote_lots_per_base_unit_per_tick
-                    / self.base_lots_per_base_unit;
+                let book_amount_in_quote_lots =
+                    self.base_lots_and_price_to_quote_atoms(*size_in_base_lots, *price_in_ticks);
 
                 out_amount += size_in_base_lots.min(
-                    &(quote_lot_budget * self.base_lots_per_base_unit
-                        / self.tick_size_in_quote_lots_per_base_unit_per_tick
-                        / price_in_ticks),
-                ) * self.base_lot_size;
+                    &((quote_lot_budget * self.num_base_lots_per_base_unit)
+                        / (self.tick_size_in_quote_atoms_per_base_unit * price_in_ticks)),
+                ) * self.base_atoms_per_base_lot;
                 quote_lot_budget = quote_lot_budget.saturating_sub(book_amount_in_quote_lots);
             }
         };
@@ -163,7 +155,7 @@ impl Amm for JupiterPhoenix {
     fn get_swap_leg_and_account_metas(
         &self,
         swap_params: &SwapParams,
-    ) -> Result<SwapLegAndAccountMetas> {
+    ) -> Result<SwapAndAccountMetas> {
         let SwapParams {
             destination_mint,
             source_mint,
@@ -219,11 +211,8 @@ impl Amm for JupiterPhoenix {
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
 
-        Ok(SwapLegAndAccountMetas {
-            swap_leg: SwapLeg::Swap {
-                /// TODO change to phoenix
-                swap: Swap::Serum { side },
-            },
+        Ok(SwapAndAccountMetas {
+            swap: Swap::Serum { side },
             account_metas,
         })
     }
@@ -237,13 +226,14 @@ impl Amm for JupiterPhoenix {
 fn test_jupiter_phoenix_integration() {
     use jupiter_core::amm::Amm;
     use solana_client::rpc_client::RpcClient;
+    use solana_sdk::pubkey;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
 
-    const SOL_USDC_MARKET: Pubkey = pubkey!("5iLqmcg8vifdnnw6wEpVtQxFE4Few5uiceDWzi3jvzH8");
+    const SOL_USDC_MARKET: Pubkey = pubkey!("4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg");
+    const BONK_USDC_MARKET: Pubkey = pubkey!("GBMoNx84HsFdVK63t8BZuDgyZhSBaeKWB4pHHpoeRM9z");
 
-    // Going to borrow the Solana FM devnet RPC
-    let rpc = RpcClient::new("https://qn-devnet.solana.fm/");
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com/");
     let account = rpc.get_account(&SOL_USDC_MARKET).unwrap();
 
     let market_account = KeyedAccount {
@@ -263,7 +253,10 @@ fn test_jupiter_phoenix_integration() {
         .enumerate()
         .fold(HashMap::new(), |mut m, (index, account)| {
             if let Some(account) = account {
-                m.insert(accounts_to_update[index], account.data.clone());
+                m.insert(
+                    accounts_to_update[index],
+                    PartialAccount::from(account.clone()),
+                );
             }
             m
         });
@@ -273,6 +266,7 @@ fn test_jupiter_phoenix_integration() {
         "Getting quote for selling {} SOL",
         in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64)
     );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
     let quote = jupiter_phoenix
         .quote(&QuoteParams {
             /// 1 SOL
@@ -284,10 +278,8 @@ fn test_jupiter_phoenix_integration() {
 
     let Quote { out_amount, .. } = quote;
 
-    println!(
-        "Quote result: {:?}",
-        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
-    );
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
+    println!("Quote result: {:?} ({})", quote_out, quote_out / quote_in);
 
     let in_amount = out_amount;
 
@@ -295,6 +287,7 @@ fn test_jupiter_phoenix_integration() {
         "Getting quote for buying SOL with {} USDC",
         in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
     );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
     let quote = jupiter_phoenix
         .quote(&QuoteParams {
             in_amount,
@@ -305,8 +298,81 @@ fn test_jupiter_phoenix_integration() {
 
     let Quote { out_amount, .. } = quote;
 
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
     println!(
-        "Quote result: {:?}",
-        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64)
+        "Quote result: {:?} ({})",
+        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64),
+        quote_in / quote_out
+    );
+
+    let account = rpc.get_account(&BONK_USDC_MARKET).unwrap();
+
+    let market_account = KeyedAccount {
+        key: BONK_USDC_MARKET,
+        account,
+        params: None,
+    };
+
+    let mut jupiter_phoenix = JupiterPhoenix::new_from_keyed_account(&market_account).unwrap();
+
+    let accounts_to_update = jupiter_phoenix.get_accounts_to_update();
+
+    let accounts_map = rpc
+        .get_multiple_accounts(&accounts_to_update)
+        .unwrap()
+        .iter()
+        .enumerate()
+        .fold(HashMap::new(), |mut m, (index, account)| {
+            if let Some(account) = account {
+                m.insert(
+                    accounts_to_update[index],
+                    PartialAccount::from(account.clone()),
+                );
+            }
+            m
+        });
+    jupiter_phoenix.update(&accounts_map).unwrap();
+    let in_amount = 100_000_000_000_000;
+    println!(
+        "Getting quote for selling {} BONK",
+        in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64)
+    );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
+    let quote = jupiter_phoenix
+        .quote(&QuoteParams {
+            /// 1B Bonk
+            in_amount,
+            input_mint: jupiter_phoenix.base_mint,
+            output_mint: jupiter_phoenix.quote_mint,
+        })
+        .unwrap();
+
+    let Quote { out_amount, .. } = quote;
+
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
+    println!("Quote result: {:?} ({})", quote_out, quote_out / quote_in);
+
+    let in_amount = out_amount;
+
+    println!(
+        "Getting quote for buying BONK with {} USDC",
+        in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64)
+    );
+    let quote_in = in_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_quote_decimals() as f64);
+    let quote = jupiter_phoenix
+        .quote(&QuoteParams {
+            in_amount,
+            input_mint: jupiter_phoenix.quote_mint,
+            output_mint: jupiter_phoenix.base_mint,
+        })
+        .unwrap();
+
+    let Quote { out_amount, .. } = quote;
+
+    let quote_out = out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64);
+    println!(
+        "Quote result: {:?} ({})",
+        out_amount as f64 / 10.0_f64.powf(jupiter_phoenix.get_base_decimals() as f64),
+        quote_in / quote_out
     );
 }
